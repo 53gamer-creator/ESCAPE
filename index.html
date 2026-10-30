@@ -1876,7 +1876,8 @@ const allQuizCategories = {"earthquake":{"name":"地震編","questions":[{"quest
     function effectiveSeVolume() { return seMuted ? 0 : seVolumeLevel; }
     function applyBgmGain() {
         if (bgmGainNode && audioCtx) {
-            bgmGainNode.gain.setValueAtTime(0.03 * effectiveBgmVolume(), audioCtx.currentTime);
+            bgmGainNode.gain.cancelScheduledValues(audioCtx.currentTime);
+            bgmGainNode.gain.setValueAtTime(BGM_MASTER_GAIN * effectiveBgmVolume(), audioCtx.currentTime);
         }
     }
     function updateMuteButton(btn, muted, label) {
@@ -2053,10 +2054,22 @@ const allQuizCategories = {"earthquake":{"name":"地震編","questions":[{"quest
 
     // --- Web Audio API SEエンジン（防災ゲーム向けに刷新） ---
     let audioCtx = null;
+    let audioMaster = null; // 全音声の出力先（音割れ防止のコンプレッサー経由）
+    const BGM_MASTER_GAIN = 0.22; // BGM基準ゲイン（初期値: 0.028 → 約8倍）
+    const SE_BOOST = 4.5;          // SE音量の倍率（初期値: 1.0 → 4.5倍）
 
     function initAudio() {
         if (!audioCtx) {
             audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            // 音量を上げても割れないよう、リミッター的にコンプレッサーを挟む
+            const comp = audioCtx.createDynamicsCompressor();
+            comp.threshold.value = -12;
+            comp.knee.value = 12;
+            comp.ratio.value = 8;
+            comp.attack.value = 0.003;
+            comp.release.value = 0.15;
+            comp.connect(audioCtx.destination);
+            audioMaster = comp;
         }
         if (audioCtx.state === 'suspended') audioCtx.resume();
     }
@@ -2071,9 +2084,9 @@ const allQuizCategories = {"earthquake":{"name":"地震編","questions":[{"quest
         osc.frequency.setValueAtTime(freq, now);
         if (endFreq) osc.frequency.exponentialRampToValueAtTime(Math.max(20, endFreq), now + duration);
         osc.connect(gain);
-        gain.connect(audioCtx.destination);
+        gain.connect(audioMaster);
         gain.gain.setValueAtTime(0.0001, now);
-        gain.gain.linearRampToValueAtTime(Math.min(volume * 1.8, 0.95) * effectiveSeVolume(), now + Math.min(0.008, duration * 0.2));
+        gain.gain.linearRampToValueAtTime(Math.min(volume * 1.8, 0.95) * SE_BOOST * effectiveSeVolume(), now + Math.min(0.008, duration * 0.2));
         gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
         osc.start(now);
         osc.stop(now + duration + 0.01);
@@ -2118,9 +2131,9 @@ const allQuizCategories = {"earthquake":{"name":"地震編","questions":[{"quest
         osc.frequency.setValueAtTime(190, now);
         osc.frequency.exponentialRampToValueAtTime(95, now + 0.24);
         osc.connect(gain);
-        gain.connect(audioCtx.destination);
+        gain.connect(audioMaster);
         gain.gain.setValueAtTime(0.0001, now);
-        gain.gain.linearRampToValueAtTime(0.22 * effectiveSeVolume(), now + 0.008);
+        gain.gain.linearRampToValueAtTime(0.22 * SE_BOOST * effectiveSeVolume(), now + 0.008);
         gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.27);
         osc.start(now);
         osc.stop(now + 0.29);
@@ -2141,9 +2154,9 @@ const allQuizCategories = {"earthquake":{"name":"地震編","questions":[{"quest
         impact.frequency.setValueAtTime(150, now);
         impact.frequency.exponentialRampToValueAtTime(55, now + 0.16);
         impact.connect(impactGain);
-        impactGain.connect(audioCtx.destination);
+        impactGain.connect(audioMaster);
         impactGain.gain.setValueAtTime(0.0001, now);
-        impactGain.gain.linearRampToValueAtTime(0.30 * effectiveSeVolume(), now + 0.006);
+        impactGain.gain.linearRampToValueAtTime(0.30 * SE_BOOST * effectiveSeVolume(), now + 0.006);
         impactGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.20);
         impact.start(now);
         impact.stop(now + 0.22);
@@ -2157,76 +2170,357 @@ const allQuizCategories = {"earthquake":{"name":"地震編","questions":[{"quest
     // 7. カウントダウン：残り時間が少ないことを知らせる、短い電子ビープ。
     function playTickSound() {
         seTone(880, 0.055, 'square', 0.035, 0, 760);
+        bgmUrgentUntil = performance.now() + 1300; // BGMに「焦り」の音を重ねる
     }
 
-    // --- 防災ゲーム向けBGM：落ち着き＋緊張感のある8bitサバイバルBGM ---
+    // --- 防災ゲーム向けBGM：画面・編ごとに曲が変わる8bit風BGM ---
+    //  menu        : タイトル・モード選択・結果（落ち着いた、希望のある曲）
+    //  game_earthquake : 地震編（低音が地鳴りのように響く、重めのDマイナー）
+    //  game_fire       : 火事編（速いテンポ＋パチパチ燃える音、切迫感のあるEマイナー）
+    //  game_storm      : 大雨・台風編（雨粒のようなアルペジオ＋エコー＋風の音）
+    // 残り5秒のカウントダウン中は、ゲーム曲に自動で「焦り」の音が重なる。
     let bgmSequencer = null;
     let bgmGainNode = null;
+    let bgmNodes = [];
+    let bgmTrackKey = null;
+    let bgmStep = 0;
+    let bgmSavedTrack = null; // 一時停止から再開したとき、小節の頭から続きを流すための記録
+    let bgmSavedStep = 0;
+    let bgmUrgentUntil = 0;   // この時刻（performance.now）まで「焦り」レイヤーを重ねる
+    let bgmNoiseBuf = null;
+    const bgmPulseWaves = {};
+
+    const BGM_NOTE_BASE = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
+    function bgmMidi(name) {
+        const m = /^([A-G])([#b]?)(\d)$/.exec(name);
+        if (!m) return null;
+        return 12 * (parseInt(m[3], 10) + 1) + BGM_NOTE_BASE[m[1]] + (m[2] === '#' ? 1 : m[2] === 'b' ? -1 : 0);
+    }
+    function bgmFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
+
+    // デューティ比つきの矩形波（ファミコン風の音色）
+    function bgmPulse(duty) {
+        if (!bgmPulseWaves[duty]) {
+            const N = 48;
+            const re = new Float32Array(N + 1);
+            const im = new Float32Array(N + 1);
+            for (let n = 1; n <= N; n++) {
+                re[n] = Math.sin(2 * Math.PI * n * duty) / (n * Math.PI);
+                im[n] = (1 - Math.cos(2 * Math.PI * n * duty)) / (n * Math.PI);
+            }
+            bgmPulseWaves[duty] = audioCtx.createPeriodicWave(re, im);
+        }
+        return bgmPulseWaves[duty];
+    }
+
+    // 8小節ループ。melody は1小節 = 8個の8分音符。'.' は前の音を伸ばす、'-' は休符。
+    // chords は [低音のMIDI番号, 'm'=短調 / 'M'=長調]。bass / arp / drums は1小節 = 16分音符16個。
+    const BGM_TRACKS = {
+        menu: {
+            bpm: 92,
+            chords: [[48,'M'],[43,'M'],[45,'m'],[41,'M'],[48,'M'],[43,'M'],[41,'M'],[43,'M']],
+            melody: [
+                'E5 . G5 . E5 D5 C5 .',
+                'D5 . G5 . B4 . D5 .',
+                'C5 . E5 . A4 C5 E5 .',
+                'A4 . C5 . F5 E5 C5 .',
+                'E5 . G5 . C6 B5 G5 .',
+                'D5 . G5 B5 A5 . G5 .',
+                'F5 . A5 . G5 F5 E5 D5',
+                'D5 . . . G4 . B4 D5'
+            ],
+            leadType: 'triangle', leadPeak: 0.20, leadSus: 0.7,
+            bass: 'r.......f.......', bassType: 'sine', bassPeak: 0.30,
+            arp: [0,-1,1,-1,2,-1,1,-1,0,-1,1,-1,2,-1,3,-1], arpShift: 12, arpDuty: 0.25, arpPeak: 0.04,
+            drums: { k: '', s: '', h: '' }
+        },
+        game_earthquake: {
+            bpm: 124, game: true, rumble: true,
+            chords: [[38,'m'],[38,'m'],[46,'M'],[46,'M'],[43,'m'],[43,'m'],[45,'M'],[45,'M']],
+            melody: [
+                'A4 . D5 F5 A5 . G5 F5',
+                'E5 . F5 . D5 . . .',
+                'D5 . F5 Bb5 . A5 F5 .',
+                'G5 . F5 . D5 . . .',
+                'G4 . Bb4 D5 . F5 D5 .',
+                'Bb4 . D5 . G5 . F5 D5',
+                'E5 . A5 . G5 . F5 E5',
+                'C#5 . E5 . A5 . . .'
+            ],
+            leadDuty: 0.25, leadPeak: 0.17, leadSus: 0.55,
+            bass: 'rr.rr.r.rr.rr.o.', bassType: 'triangle', bassPeak: 0.30,
+            arp: null,
+            drums: { k: 'x..x..x...x.x...', s: '....x.......x...', h: '..x...x...x...x.' }
+        },
+        game_fire: {
+            bpm: 138, game: true, crackle: true,
+            chords: [[40,'m'],[40,'m'],[48,'M'],[48,'M'],[50,'M'],[50,'M'],[47,'M'],[47,'M']],
+            melody: [
+                'E5 . G5 B5 . A5 G5 .',
+                'F#5 . E5 . B4 . . .',
+                'C5 . E5 G5 . E5 D5 .',
+                'E5 . D5 . C5 . . .',
+                'D5 . F#5 A5 . G5 F#5 .',
+                'A5 . F#5 . D5 . . .',
+                'B4 . D#5 F#5 . A5 F#5 .',
+                'D#5 . F#5 . B5 . . .'
+            ],
+            leadDuty: 0.125, leadPeak: 0.15, leadSus: 0.5,
+            bass: 'r.r.r.r.r.r.r.o.', bassType: 'triangle', bassPeak: 0.26,
+            arp: [0,2,1,2,0,2,1,2,0,2,1,2,0,2,3,2], arpShift: 24, arpDuty: 0.25, arpPeak: 0.05,
+            drums: { k: 'x...x...x...x...', s: '....x.......x..x', h: 'xxXxxxXxxxXxxxXx' }
+        },
+        game_storm: {
+            bpm: 108, game: true, echo: true, wind: true,
+            chords: [[45,'m'],[41,'M'],[48,'M'],[43,'M'],[45,'m'],[41,'M'],[50,'m'],[40,'M']],
+            melody: [
+                'E5 . A5 . C6 . B5 A5',
+                'A5 . F5 A5 C6 . A5 .',
+                'G5 . E5 G5 C6 . B5 G5',
+                'D5 . G5 B5 . A5 G5 .',
+                'E5 . A5 C6 . E6 D6 .',
+                'C6 . A5 . F5 . A5 C6',
+                'D5 . F5 A5 . G5 F5 .',
+                'E5 . G#5 B5 . E6 . .'
+            ],
+            leadType: 'triangle', leadPeak: 0.17, leadSus: 0.6,
+            bass: 'r.....r.r.......', bassType: 'sine', bassPeak: 0.32,
+            arp: [2,-1,3,-1,1,-1,3,-1,2,-1,3,-1,1,-1,2,3], arpShift: 24, arpType: 'triangle', arpPeak: 0.06,
+            drums: { k: 'x.....x.x.......', s: '....x.......x...', h: 'x.x.x.x.x.x.x.x.' },
+            snareVol: 0.12, hatVol: 0.05
+        }
+    };
+
+    function bgmDesiredTrack() {
+        const key = 'game_' + currentCategoryKey;
+        return (isGameStarted && BGM_TRACKS[key]) ? key : 'menu';
+    }
+
+    function bgmParseBar(str) {
+        const notes = [];
+        let last = null;
+        str.trim().split(/\s+/).forEach((tk, i) => {
+            if (tk === '.') { if (last) last.len += 2; }
+            else if (tk === '-') { last = null; }
+            else {
+                const m = bgmMidi(tk);
+                if (m != null) { last = { pos: i * 2, midi: m, len: 2 }; notes.push(last); }
+            }
+        });
+        return notes;
+    }
+
+    // 1音ぶんの発音（立ち上がり → 少し減衰 → 余韻）
+    function bgmVoice(o) {
+        const osc = audioCtx.createOscillator();
+        const g = audioCtx.createGain();
+        if (o.wave) osc.setPeriodicWave(o.wave); else osc.type = o.type || 'triangle';
+        osc.frequency.setValueAtTime(o.freq, o.t);
+        const atk = o.atk || 0.01;
+        const end = o.t + Math.max(o.dur, 0.05);
+        g.gain.setValueAtTime(0.0001, o.t);
+        g.gain.linearRampToValueAtTime(o.peak, o.t + atk);
+        const susT = Math.min(o.t + atk + 0.14, end - 0.01);
+        if (susT > o.t + atk + 0.005) {
+            g.gain.exponentialRampToValueAtTime(Math.max(o.peak * (o.sus == null ? 0.6 : o.sus), 0.0002), susT);
+        }
+        g.gain.linearRampToValueAtTime(0.0001, end + 0.04);
+        osc.connect(g);
+        g.connect(o.dest);
+        osc.start(o.t);
+        osc.stop(end + 0.06);
+    }
+
+    function bgmKick(t, v) {
+        const o = audioCtx.createOscillator();
+        const g = audioCtx.createGain();
+        o.type = 'sine';
+        o.frequency.setValueAtTime(150, t);
+        o.frequency.exponentialRampToValueAtTime(42, t + 0.12);
+        g.gain.setValueAtTime(v, t);
+        g.gain.exponentialRampToValueAtTime(0.001, t + 0.17);
+        o.connect(g);
+        g.connect(bgmGainNode);
+        o.start(t);
+        o.stop(t + 0.19);
+    }
+
+    function bgmNoiseHit(t, dur, v, filterType, freq) {
+        const src = audioCtx.createBufferSource();
+        src.buffer = bgmNoiseBuf;
+        const f = audioCtx.createBiquadFilter();
+        f.type = filterType;
+        f.frequency.value = freq;
+        const g = audioCtx.createGain();
+        g.gain.setValueAtTime(v, t);
+        g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+        src.connect(f);
+        f.connect(g);
+        g.connect(bgmGainNode);
+        src.start(t, Math.random() * 0.5);
+        src.stop(t + dur + 0.02);
+    }
+
+    // 地鳴り・風のような、ゆっくり膨らむノイズ
+    function bgmTexture(t, dur, filterType, f0, f1, peak) {
+        const src = audioCtx.createBufferSource();
+        src.buffer = bgmNoiseBuf;
+        src.loop = true;
+        const f = audioCtx.createBiquadFilter();
+        f.type = filterType;
+        f.frequency.setValueAtTime(f0, t);
+        f.frequency.linearRampToValueAtTime(f1, t + dur * 0.5);
+        f.frequency.linearRampToValueAtTime(f0, t + dur);
+        const g = audioCtx.createGain();
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.linearRampToValueAtTime(peak, t + dur * 0.5);
+        g.gain.linearRampToValueAtTime(0.0001, t + dur);
+        src.connect(f);
+        f.connect(g);
+        g.connect(bgmGainNode);
+        src.start(t);
+        src.stop(t + dur + 0.05);
+    }
 
     function startBGM() {
         initAudio();
-        if (bgmSequencer) return;
+        const want = bgmDesiredTrack();
+        if (bgmSequencer) {
+            if (bgmTrackKey === want) return;
+            stopBGM(); // 画面や編が変わったら曲を切り替える
+        }
+        const track = BGM_TRACKS[want];
+        bgmTrackKey = want;
 
+        if (!bgmNoiseBuf) {
+            bgmNoiseBuf = audioCtx.createBuffer(1, audioCtx.sampleRate, audioCtx.sampleRate);
+            const d = bgmNoiseBuf.getChannelData(0);
+            for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+        }
+
+        const now = audioCtx.currentTime;
         bgmGainNode = audioCtx.createGain();
-        bgmGainNode.gain.setValueAtTime(0.028 * effectiveBgmVolume(), audioCtx.currentTime);
-        bgmGainNode.connect(audioCtx.destination);
+        bgmGainNode.gain.setValueAtTime(0.0001, now);
+        bgmGainNode.gain.linearRampToValueAtTime(BGM_MASTER_GAIN * effectiveBgmVolume(), now + 0.35);
+        bgmGainNode.connect(audioMaster);
 
-        // 速すぎず、緊張感を保ちつつ「防災を学ぶゲーム」に合うテンポ
-        const bpm = 112;
-        const stepTime = 60 / bpm / 2;
+        // メロディ・アルペジオ用のバス（編によってはエコーを付ける）
+        const leadBus = audioCtx.createGain();
+        leadBus.connect(bgmGainNode);
+        bgmNodes = [leadBus];
+        if (track.echo) {
+            const dl = audioCtx.createDelay(1.0);
+            dl.delayTime.value = 60 / track.bpm * 0.75;
+            const fb = audioCtx.createGain();
+            fb.gain.value = 0.38;
+            const wet = audioCtx.createGain();
+            wet.gain.value = 0.45;
+            leadBus.connect(dl);
+            dl.connect(fb);
+            fb.connect(dl);
+            dl.connect(wet);
+            wet.connect(bgmGainNode);
+            bgmNodes.push(dl, fb, wet);
+        }
 
-        // Am → F → C → G。明るさを残しながら、危機感も感じられる進行。
-        const melody = [
-            440, 0, 523.25, 587.33, 659.25, 0, 587.33, 523.25,
-            349.23, 0, 440, 523.25, 587.33, 0, 523.25, 440,
-            523.25, 0, 659.25, 783.99, 659.25, 587.33, 523.25, 0,
-            392, 0, 493.88, 587.33, 659.25, 587.33, 493.88, 0
-        ];
+        const stepTime = 60 / track.bpm / 4; // 16分音符
+        const melodyBars = track.melody.map(bgmParseBar);
+        const barCount = track.chords.length;
+        const leadWave = track.leadDuty ? bgmPulse(track.leadDuty) : null;
+        const arpWave = track.arpDuty ? bgmPulse(track.arpDuty) : null;
 
-        // 低音は控えめにして、SEや問題文を邪魔しないようにする
-        const bass = [220, 220, 174.61, 174.61, 261.63, 261.63, 196, 196];
+        let step = (bgmSavedTrack === want) ? bgmSavedStep - (bgmSavedStep % 16) : 0;
+        let nextNoteTime = now + 0.06;
 
-        let step = 0;
-        let nextNoteTime = audioCtx.currentTime;
+        function scheduleStep(s, t) {
+            const bar = Math.floor(s / 16) % barCount;
+            const pos = s % 16;
+            const chord = track.chords[bar];
+            const root = chord[0];
+            const tones = chord[1] === 'm' ? [0, 3, 7, 12] : [0, 4, 7, 12];
+
+            // メロディ
+            melodyBars[bar].forEach(n => {
+                if (n.pos !== pos) return;
+                bgmVoice({
+                    t: t, dur: n.len * stepTime * 0.95, freq: bgmFreq(n.midi),
+                    wave: leadWave, type: track.leadType, peak: track.leadPeak,
+                    atk: 0.012, sus: track.leadSus, dest: leadBus
+                });
+            });
+
+            // ベース
+            const bc = track.bass[pos];
+            if (bc && bc !== '.') {
+                let len = 1;
+                while (pos + len < 16 && track.bass[pos + len] === '.') len++;
+                const off = bc === 'f' ? 7 : bc === 'o' ? 12 : 0;
+                bgmVoice({
+                    t: t, dur: len * stepTime * 0.95, freq: bgmFreq(root + off),
+                    type: track.bassType, peak: track.bassPeak, atk: 0.012, sus: 0.7, dest: bgmGainNode
+                });
+            }
+
+            // アルペジオ
+            if (track.arp) {
+                const idx = track.arp[pos];
+                if (idx >= 0) {
+                    bgmVoice({
+                        t: t, dur: stepTime * 1.6, freq: bgmFreq(root + tones[idx] + track.arpShift),
+                        wave: arpWave, type: track.arpType, peak: track.arpPeak,
+                        atk: 0.004, sus: 0.3, dest: leadBus
+                    });
+                }
+            }
+
+            // ドラム
+            const dr = track.drums;
+            if (dr.k[pos] === 'x') bgmKick(t, 0.55);
+            if (dr.s[pos] === 'x') {
+                const sv = track.snareVol || 0.2;
+                bgmNoiseHit(t, 0.13, sv, 'bandpass', 1900);
+                bgmVoice({ t: t, dur: 0.07, freq: 200, type: 'triangle', peak: sv * 0.8, atk: 0.002, sus: 0.3, dest: bgmGainNode });
+            }
+            const hc = dr.h[pos];
+            const urgent = track.game && performance.now() < bgmUrgentUntil;
+            if (hc === 'x' || hc === 'X') {
+                const hv = track.hatVol || 0.07;
+                bgmNoiseHit(t, 0.04, hc === 'X' ? hv * 1.5 : hv, 'highpass', 7000);
+            } else if (urgent) {
+                bgmNoiseHit(t, 0.035, 0.06, 'highpass', 7500);
+            }
+
+            // 残り時間わずか：低音の刻みを重ねて焦りを演出
+            if (urgent && pos % 2 === 0) {
+                bgmVoice({
+                    t: t, dur: stepTime * 1.4, freq: bgmFreq(root + 24),
+                    wave: bgmPulse(0.5), peak: 0.07, atk: 0.004, sus: 0.4, dest: bgmGainNode
+                });
+            }
+
+            // 環境音：地鳴り（地震）・風（台風）・パチパチ（火事）
+            if (pos === 0 && bar % 2 === 0) {
+                if (track.rumble) bgmTexture(t, stepTime * 32, 'lowpass', 90, 200, 0.5);
+                if (track.wind) bgmTexture(t, stepTime * 32, 'bandpass', 500, 1100, 0.07);
+            }
+            if (track.crackle && Math.random() < 0.22) {
+                bgmNoiseHit(t + Math.random() * stepTime, 0.025, 0.07, 'highpass', 3500);
+            }
+        }
 
         function scheduler() {
-            while (nextNoteTime < audioCtx.currentTime + 0.1) {
-                const melFreq = melody[step % melody.length];
-                if (melFreq > 0) {
-                    const osc = audioCtx.createOscillator();
-                    const gain = audioCtx.createGain();
-                    osc.type = 'triangle';
-                    osc.frequency.setValueAtTime(melFreq, nextNoteTime);
-                    gain.gain.setValueAtTime(0.001, nextNoteTime);
-                    gain.gain.linearRampToValueAtTime(0.28, nextNoteTime + 0.012);
-                    gain.gain.exponentialRampToValueAtTime(0.001, nextNoteTime + stepTime * 0.82);
-                    osc.connect(gain);
-                    gain.connect(bgmGainNode);
-                    osc.start(nextNoteTime);
-                    osc.stop(nextNoteTime + stepTime * 0.85);
-                }
-
-                if (step % 4 === 0) {
-                    const bassFreq = bass[Math.floor(step / 4) % bass.length];
-                    const oscB = audioCtx.createOscillator();
-                    const gainB = audioCtx.createGain();
-                    oscB.type = 'sine';
-                    oscB.frequency.setValueAtTime(bassFreq, nextNoteTime);
-                    gainB.gain.setValueAtTime(0.001, nextNoteTime);
-                    gainB.gain.linearRampToValueAtTime(0.22, nextNoteTime + 0.015);
-                    gainB.gain.exponentialRampToValueAtTime(0.001, nextNoteTime + stepTime * 3.4);
-                    oscB.connect(gainB);
-                    gainB.connect(bgmGainNode);
-                    oscB.start(nextNoteTime);
-                    oscB.stop(nextNoteTime + stepTime * 3.5);
-                }
-
+            const cur = audioCtx.currentTime;
+            if (nextNoteTime < cur - 0.25) nextNoteTime = cur + 0.05; // タブが止まっていた後の取り戻しを防ぐ
+            while (nextNoteTime < cur + 0.12) {
+                scheduleStep(step, nextNoteTime);
                 nextNoteTime += stepTime;
                 step++;
+                bgmStep = step;
             }
             bgmSequencer = setTimeout(scheduler, 25);
         }
 
+        bgmStep = step;
         scheduler();
     }
 
@@ -2234,11 +2528,21 @@ const allQuizCategories = {"earthquake":{"name":"地震編","questions":[{"quest
         if (bgmSequencer) {
             clearTimeout(bgmSequencer);
             bgmSequencer = null;
+            bgmSavedTrack = bgmTrackKey;
+            bgmSavedStep = bgmStep;
         }
         if (bgmGainNode) {
             try { bgmGainNode.disconnect(); } catch(e) {}
             bgmGainNode = null;
         }
+        bgmNodes.forEach(n => { try { n.disconnect(); } catch(e) {} });
+        bgmNodes = [];
+    }
+
+    // 新しくゲームを始めるときは、曲を頭から流す
+    function bgmResetPosition() {
+        bgmSavedTrack = null;
+        bgmSavedStep = 0;
     }
 
     // 変更: 引数brokenIndexを渡すと、そのインデックスのハートが「割れる」演出（アニメーション＋SE）付きで消える
@@ -2548,6 +2852,7 @@ const allQuizCategories = {"earthquake":{"name":"地震編","questions":[{"quest
             : (`HI-SCORE: ${getHighScore(getScoreStorageKey(categoryKey))}`);
 
         loadStage(currentStage);
+        bgmResetPosition();
         startBGM();
     }
 
